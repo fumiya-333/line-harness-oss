@@ -29,6 +29,7 @@ import {
 import { buildIntroMessage } from '../services/intro-message.js';
 import { attachTagAndFireSideEffects } from '../services/friend-tag-attach.js';
 import { pushImmediateFirstStep } from '../services/immediate-first-step.js';
+import { stopFriendAddEnrollmentsForReferral } from '../services/referral-friend-add-override.js';
 import { notifyAffiliateFriendAdd } from '../services/affiliate-notifier.js';
 import { verifyCallerLineUserId } from '../services/liff-auth.js';
 import { awardActivityMileage } from '../services/activity-mileage.js';
@@ -842,10 +843,15 @@ liffRoutes.get('/auth/callback', async (c) => {
     // xh: refs are X Harness one-time tokens (the token IS the secret) — never persist as ref_code
     if (ref && !ref.startsWith('xh:')) {
       // Save ref_code on the friend record (first touch wins — only set if not already set)
-      await db
+      const refSaved = await db
         .prepare(`UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL`)
         .bind(ref, friend.id)
         .run();
+      if ((refSaved.meta?.changes ?? 0) > 0) {
+        // The follow webhook may have enrolled account friend_add scenarios
+        // before this ref was recorded; honor the route's override for them.
+        await stopFriendAddEnrollmentsForReferral(db, friend.id, ref);
+      }
 
       // Look up entry route config
       const route = await getEntryRouteByRefCode(db, ref);
@@ -1267,8 +1273,11 @@ liffRoutes.post('/api/liff/link', async (c) => {
     if (linkedUserId) {
       // Still save ref even if already linked (but never persist xh: tokens as ref_code)
       if (body.ref && !body.ref.startsWith('xh:')) {
-        await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
+        const refSaved = await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
           .bind(body.ref, friend.id).run();
+        if ((refSaved.meta?.changes ?? 0) > 0) {
+          await stopFriendAddEnrollmentsForReferral(db, friend.id, body.ref);
+        }
       }
       // Apply ref attribution (tag + scenario push) for already-linked friends.
       // /auth/callback only fires for new OAuth flows, so existing friends
@@ -1341,8 +1350,14 @@ liffRoutes.post('/api/liff/link', async (c) => {
     // Save ref_code from LIFF (first touch wins)
     // xh: refs are X Harness one-time tokens — never persist as ref_code
     if (body.ref && !body.ref.startsWith('xh:')) {
-      await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
+      const refSaved = await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
         .bind(body.ref, friend.id).run();
+      if ((refSaved.meta?.changes ?? 0) > 0) {
+        // First-time friends reach here after the follow webhook already
+        // enrolled them (the pre-add POST 404s; the post-add retry lands
+        // here). Honor the route's friend_add override for those rows.
+        await stopFriendAddEnrollmentsForReferral(db, friend.id, body.ref);
+      }
 
       // Record ref tracking
       try {
